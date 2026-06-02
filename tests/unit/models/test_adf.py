@@ -605,6 +605,189 @@ class TestMarkdownToAdf:
             assert word in text_back
 
 
+class TestMarkdownToAdfBugRegressions:
+    """Focused regression tests for the markdown_to_adf converter.
+
+    These cover the concrete failure modes that motivated replacing the
+    hand-rolled regex parser with a real CommonMark tokenizer.
+    """
+
+    @staticmethod
+    def _texts_with_marks(node: dict, mark_type: str) -> list[str]:
+        """Collect all text-node strings carrying the given mark type."""
+        results: list[str] = []
+
+        def walk(n):
+            if isinstance(n, dict):
+                if n.get("type") == "text" and any(
+                    m.get("type") == mark_type for m in n.get("marks", [])
+                ):
+                    results.append(n["text"])
+                for child in n.get("content", []):
+                    walk(child)
+            elif isinstance(n, list):
+                for child in n:
+                    walk(child)
+
+        walk(node)
+        return results
+
+    @staticmethod
+    def _all_marks(node: dict) -> set[str]:
+        """Collect every mark type used anywhere in the document."""
+        marks: set[str] = set()
+
+        def walk(n):
+            if isinstance(n, dict):
+                for m in n.get("marks", []):
+                    marks.add(m.get("type"))
+                for child in n.get("content", []):
+                    walk(child)
+            elif isinstance(n, list):
+                for child in n:
+                    walk(child)
+
+        walk(node)
+        return marks
+
+    # -- Bold renders as a strong mark, not literal asterisks --------------
+
+    def test_bold_not_literal_asterisks(self):
+        result = markdown_to_adf("This is **really bold** text")
+        bold = self._texts_with_marks(result, "strong")
+        assert bold == ["really bold"]
+        # No stray asterisks should leak into any text node.
+        text = adf_to_text(result) or ""
+        assert "*" not in text
+
+    # -- Inline code is verbatim (backticks gone, content untouched) -------
+
+    def test_inline_code_verbatim_single_node(self):
+        result = markdown_to_adf("Run `git status --short` now")
+        code = self._texts_with_marks(result, "code")
+        assert code == ["git status --short"]
+        # The code span must be a single contiguous node, not split per line.
+        text = adf_to_text(result) or ""
+        assert "`" not in text
+
+    def test_inline_code_content_not_reparsed(self):
+        # Markdown-ish content inside a code span stays literal.
+        result = markdown_to_adf("Value `a_b * c **d**` here")
+        code = self._texts_with_marks(result, "code")
+        assert code == ["a_b * c **d**"]
+        # No emphasis/strong marks should have been created from code content.
+        assert "em" not in self._all_marks(result)
+        assert "strong" not in self._all_marks(result)
+
+    # -- Intra-word underscores stay literal (the headline bug) ------------
+
+    @pytest.mark.parametrize(
+        "identifier",
+        ["tsm_modems", "platform_bnm_prod.yml", "a_b_c", "snake_case_name"],
+    )
+    def test_underscore_identifiers_left_alone(self, identifier):
+        result = markdown_to_adf(f"Deploy {identifier} today")
+        # No emphasis mark should be produced.
+        assert "em" not in self._all_marks(result)
+        text = adf_to_text(result) or ""
+        assert identifier in text
+
+    # -- Multi-line text grouped into one paragraph per blank-line block ---
+
+    def test_multiline_paragraph_grouping(self):
+        md = "Line one\nline two\nline three\n\nSecond paragraph"
+        result = markdown_to_adf(md)
+        paragraphs = [n for n in result["content"] if n["type"] == "paragraph"]
+        # Two paragraphs total (blank line separates them), NOT one per line.
+        assert len(paragraphs) == 2
+        first_text = adf_to_text(paragraphs[0]) or ""
+        for word in ["Line one", "line two", "line three"]:
+            assert word in first_text
+        assert "Second paragraph" in (adf_to_text(paragraphs[1]) or "")
+
+    # -- Fenced code block -------------------------------------------------
+
+    def test_fenced_code_block_multiline(self):
+        md = "```yaml\nkey: value\nlist:\n  - a\n  - b\n```"
+        result = markdown_to_adf(md)
+        cb = next(n for n in result["content"] if n["type"] == "codeBlock")
+        assert cb["attrs"]["language"] == "yaml"
+        code = cb["content"][0]["text"]
+        assert code == "key: value\nlist:\n  - a\n  - b"
+
+    # -- Bullet list -------------------------------------------------------
+
+    def test_bullet_list_variants(self):
+        md = "- alpha\n* beta\n+ gamma"
+        result = markdown_to_adf(md)
+        # markdown-it treats a changed bullet marker as a new list; what
+        # matters is that every item becomes a listItem > paragraph.
+        items = []
+        for node in result["content"]:
+            if node["type"] == "bulletList":
+                items.extend(node["content"])
+        assert len(items) == 3
+        for item in items:
+            assert item["type"] == "listItem"
+            assert item["content"][0]["type"] == "paragraph"
+
+    # -- Heading -----------------------------------------------------------
+
+    def test_heading_with_inline_code(self):
+        result = markdown_to_adf("## Deploy `tsm_modems`")
+        heading = result["content"][0]
+        assert heading["type"] == "heading"
+        assert heading["attrs"]["level"] == 2
+        code = self._texts_with_marks(heading, "code")
+        assert code == ["tsm_modems"]
+
+    # -- Realistic mixed Jira comment --------------------------------------
+
+    def test_realistic_jira_comment(self):
+        md = (
+            "## Investigation\n"
+            "\n"
+            "The job `platform_bnm_prod.yml` failed because of "
+            "**missing credentials**.\n"
+            "\n"
+            "Steps to reproduce:\n"
+            "\n"
+            "- Open the `tsm_modems` config\n"
+            "- Run the pipeline\n"
+            "- Observe the `a_b_c` error\n"
+            "\n"
+            "```bash\n"
+            "kubectl get pods\n"
+            "```\n"
+        )
+        result = markdown_to_adf(md)
+        types = [n["type"] for n in result["content"]]
+
+        assert "heading" in types
+        assert "bulletList" in types
+        assert "codeBlock" in types
+
+        # Heading text correct.
+        heading = next(n for n in result["content"] if n["type"] == "heading")
+        assert (adf_to_text(heading) or "") == "Investigation"
+
+        # Bold mark present, intra-word underscores never became emphasis.
+        marks = self._all_marks(result)
+        assert "strong" in marks
+        assert "code" in marks
+        assert "em" not in marks
+
+        # Identifiers survive verbatim in the rendered text.
+        text = adf_to_text(result) or ""
+        for ident in ["platform_bnm_prod.yml", "tsm_modems", "a_b_c"]:
+            assert ident in text
+
+        # Code block content preserved.
+        cb = next(n for n in result["content"] if n["type"] == "codeBlock")
+        assert cb["attrs"]["language"] == "bash"
+        assert cb["content"][0]["text"] == "kubectl get pods"
+
+
 class TestMarkdownToJiraDispatch:
     """Tests for _markdown_to_jira Cloud/Server dispatch."""
 
