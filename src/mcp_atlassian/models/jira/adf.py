@@ -3,18 +3,103 @@ Atlassian Document Format (ADF) utilities.
 
 This module provides utilities for converting between ADF and other formats.
 Supports both ADF → plain text (for reading) and Markdown → ADF (for writing).
+
+The Markdown → ADF conversion is backed by ``markdown-it-py`` (a CommonMark
+compliant tokenizer) rather than hand-rolled regexes. This makes the converter
+robust against the classic pitfalls of naive parsers, notably:
+
+* ``**bold**`` / ``*italic*`` / ``_italic_`` / ``~~strike~~`` / ``` `code` ```
+  inline marks (including nesting such as ``***both***``).
+* Intra-word underscores (``tsm_modems``, ``platform_bnm_prod.yml``, ``a_b_c``)
+  stay literal — CommonMark forbids emphasis inside a word.
+* Inline code spans are emitted verbatim (no inner mark parsing/escaping).
+* Consecutive non-blank lines are grouped into a single paragraph; blank lines
+  separate paragraphs.
+* Fenced code blocks, ATX headings, bullet/ordered lists, blockquotes and GFM
+  tables map to the corresponding ADF nodes.
 """
 
-import re
 from datetime import datetime, timezone
 from typing import Any
+
+from markdown_it import MarkdownIt
+from markdown_it.token import Token
+
+# A single shared, CommonMark-compliant parser instance with GFM tables and
+# strikethrough enabled. CommonMark's emphasis rules already forbid intra-word
+# ``_`` emphasis, which is exactly the behaviour we want for identifiers.
+_MD = MarkdownIt("commonmark").enable("table").enable("strikethrough")
+
+# Maps markdown-it inline open/close tag -> ADF mark spec (without attrs).
+_MARK_FOR_TAG: dict[str, dict[str, Any]] = {
+    "strong": {"type": "strong"},
+    "em": {"type": "em"},
+    "s": {"type": "strike"},
+}
+
+
+def _apply_marks(text: str, marks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build an ADF text node, attaching the active marks (if any)."""
+    node: dict[str, Any] = {"type": "text", "text": text}
+    if marks:
+        # Copy so callers mutating their stack don't corrupt emitted nodes.
+        node["marks"] = [dict(m) for m in marks]
+    return node
+
+
+def _inline_tokens_to_adf(tokens: list[Token]) -> list[dict[str, Any]]:
+    """Convert the children of a markdown-it ``inline`` token to ADF nodes.
+
+    Walks the flat open/close token stream maintaining a stack of active marks.
+    """
+    nodes: list[dict[str, Any]] = []
+    marks_stack: list[dict[str, Any]] = []
+
+    for tok in tokens:
+        ttype = tok.type
+
+        if ttype == "text":
+            if tok.content:
+                nodes.append(_apply_marks(tok.content, marks_stack))
+        elif ttype == "code_inline":
+            # Inline code is verbatim: a code mark, no inner parsing.
+            node: dict[str, Any] = {
+                "type": "text",
+                "text": tok.content,
+                "marks": [dict(m) for m in marks_stack] + [{"type": "code"}],
+            }
+            nodes.append(node)
+        elif ttype in ("softbreak", "hardbreak"):
+            nodes.append({"type": "hardBreak"})
+        elif ttype in ("strong_open", "em_open", "s_open"):
+            mark = _MARK_FOR_TAG.get(tok.tag)
+            if mark is not None:
+                marks_stack.append(mark)
+        elif ttype in ("strong_close", "em_close", "s_close"):
+            if marks_stack:
+                marks_stack.pop()
+        elif ttype == "link_open":
+            href = tok.attrs.get("href", "") if tok.attrs else ""
+            marks_stack.append({"type": "link", "attrs": {"href": href}})
+        elif ttype == "link_close":
+            if marks_stack:
+                marks_stack.pop()
+        elif ttype == "image":
+            # ADF has no inline image mark here; fall back to alt text.
+            alt = tok.content or (tok.attrs.get("alt", "") if tok.attrs else "")
+            if alt:
+                nodes.append(_apply_marks(alt, marks_stack))
+        # Any other inline token type is ignored gracefully.
+
+    return nodes
 
 
 def _parse_inline_formatting(text: str) -> list[dict[str, Any]]:
     """Parse inline Markdown formatting into ADF inline nodes.
 
-    Handles: bold (**), italic (*), inline code (`), links ([text](url)),
-    and strikethrough (~~).
+    Handles: bold (``**``), italic (``*`` / ``_``), inline code (`` ` ``),
+    links (``[text](url)``) and strikethrough (``~~``), including reasonable
+    nesting. Intra-word underscores are left literal.
 
     Args:
         text: Raw text potentially containing inline Markdown formatting.
@@ -25,80 +110,15 @@ def _parse_inline_formatting(text: str) -> list[dict[str, Any]]:
     if not text:
         return []
 
+    # ``parseInline`` yields a single top-level "inline" token whose children
+    # are the actual inline nodes.
+    tokens = _MD.parseInline(text)
     nodes: list[dict[str, Any]] = []
-    # Pattern order matters: bold before italic, code before others
-    inline_re = re.compile(
-        r"`(?P<code_inner>[^`]+)`"
-        r"|\*\*(?P<bold_inner>.+?)\*\*"
-        r"|~~(?P<strike_inner>.+?)~~"
-        r"|\[(?P<link_text>[^\]]+)\]\((?P<link_href>[^)]+)\)"
-        r"|(?<!\*)\*(?!\*)(?P<italic_inner>.+?)(?<!\*)\*(?!\*)"
-    )
+    for tok in tokens:
+        if tok.type == "inline" and tok.children:
+            nodes.extend(_inline_tokens_to_adf(tok.children))
 
-    pos = 0
-    for m in inline_re.finditer(text):
-        # Add any plain text before this match
-        if m.start() > pos:
-            plain = text[pos : m.start()]
-            if plain:
-                nodes.append({"type": "text", "text": plain})
-
-        if m.group("code_inner") is not None:
-            nodes.append(
-                {
-                    "type": "text",
-                    "text": m.group("code_inner"),
-                    "marks": [{"type": "code"}],
-                }
-            )
-        elif m.group("bold_inner") is not None:
-            nodes.append(
-                {
-                    "type": "text",
-                    "text": m.group("bold_inner"),
-                    "marks": [{"type": "strong"}],
-                }
-            )
-        elif m.group("strike_inner") is not None:
-            nodes.append(
-                {
-                    "type": "text",
-                    "text": m.group("strike_inner"),
-                    "marks": [{"type": "strike"}],
-                }
-            )
-        elif m.group("link_text") is not None:
-            nodes.append(
-                {
-                    "type": "text",
-                    "text": m.group("link_text"),
-                    "marks": [
-                        {
-                            "type": "link",
-                            "attrs": {"href": m.group("link_href")},
-                        }
-                    ],
-                }
-            )
-        elif m.group("italic_inner") is not None:
-            nodes.append(
-                {
-                    "type": "text",
-                    "text": m.group("italic_inner"),
-                    "marks": [{"type": "em"}],
-                }
-            )
-
-        pos = m.end()
-
-    # Remaining plain text after last match
-    if pos < len(text):
-        remaining = text[pos:]
-        if remaining:
-            nodes.append({"type": "text", "text": remaining})
-
-    # If no patterns matched, return the whole thing as plain text
-    if not nodes and text:
+    if not nodes:
         nodes.append({"type": "text", "text": text})
 
     return nodes
@@ -117,11 +137,176 @@ def _make_list_item(text: str) -> dict[str, Any]:
     return {"type": "listItem", "content": [_make_paragraph(text)]}
 
 
+def _inline_content_from_token(token: Token | None) -> list[dict[str, Any]]:
+    """Convert an ``inline`` container token into ADF inline nodes."""
+    if token is None or not token.children:
+        return []
+    return _inline_tokens_to_adf(token.children)
+
+
+def _block_tokens_to_adf(
+    tokens: list[Token], start: int, stop_close: str | None
+) -> tuple[list[dict[str, Any]], int]:
+    """Convert a run of block tokens to ADF nodes.
+
+    Args:
+        tokens: Full flat token list.
+        start: Index to start consuming from.
+        stop_close: Token type that terminates this run (e.g. the matching
+            ``bullet_list_close``), or ``None`` to consume to the end.
+
+    Returns:
+        ``(nodes, next_index)`` where ``next_index`` is the index *after* the
+        closing token (or after the consumed run).
+    """
+    nodes: list[dict[str, Any]] = []
+    i = start
+
+    while i < len(tokens):
+        tok = tokens[i]
+        if stop_close is not None and tok.type == stop_close:
+            return nodes, i + 1
+
+        ttype = tok.type
+
+        if ttype == "paragraph_open":
+            inline = tokens[i + 1] if i + 1 < len(tokens) else None
+            content = _inline_content_from_token(inline)
+            if not content:
+                content = [{"type": "text", "text": ""}]
+            nodes.append({"type": "paragraph", "content": content})
+            # Skip paragraph_open, inline, paragraph_close.
+            i += 3
+            continue
+
+        if ttype == "heading_open":
+            level = int(tok.tag[1]) if len(tok.tag) > 1 else 1
+            inline = tokens[i + 1] if i + 1 < len(tokens) else None
+            content = _inline_content_from_token(inline)
+            nodes.append(
+                {
+                    "type": "heading",
+                    "attrs": {"level": level},
+                    "content": content,
+                }
+            )
+            i += 3
+            continue
+
+        if ttype == "fence" or ttype == "code_block":
+            lang = ""
+            if ttype == "fence" and tok.info:
+                lang = tok.info.strip().split()[0] if tok.info.strip() else ""
+            code_text = tok.content
+            # markdown-it appends a trailing newline to fence/code content.
+            if code_text.endswith("\n"):
+                code_text = code_text[:-1]
+            cb: dict[str, Any] = {
+                "type": "codeBlock",
+                "attrs": {"language": lang} if lang else {},
+                "content": [{"type": "text", "text": code_text}] if code_text else [],
+            }
+            nodes.append(cb)
+            i += 1
+            continue
+
+        if ttype == "bullet_list_open":
+            children, i = _block_tokens_to_adf(tokens, i + 1, "bullet_list_close")
+            nodes.append({"type": "bulletList", "content": children})
+            continue
+
+        if ttype == "ordered_list_open":
+            attrs: dict[str, Any] = {}
+            start_attr = tok.attrs.get("start") if tok.attrs else None
+            if start_attr is not None:
+                try:
+                    attrs["order"] = int(start_attr)
+                except (TypeError, ValueError):
+                    pass
+            children, i = _block_tokens_to_adf(tokens, i + 1, "ordered_list_close")
+            node: dict[str, Any] = {"type": "orderedList", "content": children}
+            if attrs:
+                node["attrs"] = attrs
+            nodes.append(node)
+            continue
+
+        if ttype == "list_item_open":
+            children, i = _block_tokens_to_adf(tokens, i + 1, "list_item_close")
+            if not children:
+                children = [{"type": "paragraph", "content": []}]
+            nodes.append({"type": "listItem", "content": children})
+            continue
+
+        if ttype == "blockquote_open":
+            children, i = _block_tokens_to_adf(tokens, i + 1, "blockquote_close")
+            if not children:
+                children = [{"type": "paragraph", "content": []}]
+            nodes.append({"type": "blockquote", "content": children})
+            continue
+
+        if ttype == "hr":
+            nodes.append({"type": "rule"})
+            i += 1
+            continue
+
+        if ttype == "table_open":
+            table_node, i = _table_to_adf(tokens, i)
+            nodes.append(table_node)
+            continue
+
+        # Unhandled block token: advance to avoid an infinite loop.
+        i += 1
+
+    return nodes, i
+
+
+def _table_to_adf(tokens: list[Token], start: int) -> tuple[dict[str, Any], int]:
+    """Convert a markdown-it table token run into an ADF table node."""
+    rows: list[dict[str, Any]] = []
+    current_cells: list[dict[str, Any]] | None = None
+    cell_type = "tableCell"
+    i = start + 1  # skip table_open
+
+    while i < len(tokens):
+        tok = tokens[i]
+        ttype = tok.type
+        if ttype == "table_close":
+            i += 1
+            break
+        if ttype == "tr_open":
+            current_cells = []
+        elif ttype == "tr_close":
+            if current_cells is not None:
+                rows.append({"type": "tableRow", "content": current_cells})
+            current_cells = None
+        elif ttype in ("th_open", "td_open"):
+            cell_type = "tableHeader" if ttype == "th_open" else "tableCell"
+            inline = tokens[i + 1] if i + 1 < len(tokens) else None
+            content = _inline_content_from_token(inline)
+            if not content:
+                content = [{"type": "text", "text": ""}]
+            if current_cells is not None:
+                current_cells.append(
+                    {
+                        "type": cell_type,
+                        "content": [{"type": "paragraph", "content": content}],
+                    }
+                )
+        i += 1
+
+    table_node = {
+        "type": "table",
+        "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
+        "content": rows,
+    }
+    return table_node, i
+
+
 def markdown_to_adf(markdown_text: str) -> dict[str, Any]:
     """Convert Markdown text to ADF (Atlassian Document Format) document.
 
-    Implements a line-by-line parser that handles common Markdown constructs.
-    No external dependencies required.
+    Tokenizes the input with ``markdown-it-py`` (CommonMark + GFM tables and
+    strikethrough) and maps the token stream to ADF nodes.
 
     Args:
         markdown_text: Markdown-formatted text to convert.
@@ -135,139 +320,11 @@ def markdown_to_adf(markdown_text: str) -> dict[str, Any]:
         doc["content"].append({"type": "paragraph", "content": []})
         return doc
 
-    lines = markdown_text.split("\n")
-    i = 0
+    tokens = _MD.parse(markdown_text)
+    content, _ = _block_tokens_to_adf(tokens, 0, None)
+    doc["content"] = content
 
-    while i < len(lines):
-        line = lines[i]
-
-        # --- Fenced code block ---
-        if line.startswith("```"):
-            lang = line[3:].strip()
-            code_lines: list[str] = []
-            i += 1
-            while i < len(lines) and not lines[i].startswith("```"):
-                code_lines.append(lines[i])
-                i += 1
-            # Skip closing ```
-            if i < len(lines):
-                i += 1
-            cb: dict[str, Any] = {
-                "type": "codeBlock",
-                "attrs": {"language": lang} if lang else {},
-                "content": [{"type": "text", "text": "\n".join(code_lines)}],
-            }
-            doc["content"].append(cb)
-            continue
-
-        # --- Horizontal rule ---
-        stripped = line.strip()
-        if stripped in ("---", "***", "___") or (
-            len(stripped) >= 3
-            and all(c == stripped[0] for c in stripped)
-            and stripped[0] in "-*_"
-        ):
-            # Make sure it's not a list item like "- --"
-            if not line.startswith("- ") and not line.startswith("* "):
-                doc["content"].append({"type": "rule"})
-                i += 1
-                continue
-
-        # --- Heading ---
-        heading_match = re.match(r"^(#{1,6})\s+(.+)$", line)
-        if heading_match:
-            level = len(heading_match.group(1))
-            text = heading_match.group(2)
-            heading_node: dict[str, Any] = {
-                "type": "heading",
-                "attrs": {"level": level},
-                "content": _parse_inline_formatting(text),
-            }
-            doc["content"].append(heading_node)
-            i += 1
-            continue
-
-        # --- Blockquote ---
-        if line.startswith("> "):
-            quote_lines: list[str] = []
-            while i < len(lines) and lines[i].startswith("> "):
-                quote_lines.append(lines[i][2:])
-                i += 1
-            bq_content = [_make_paragraph(ln) for ln in quote_lines]
-            doc["content"].append({"type": "blockquote", "content": bq_content})
-            continue
-
-        # --- Unordered list ---
-        if re.match(r"^[-*]\s+", line):
-            items: list[dict[str, Any]] = []
-            while i < len(lines) and re.match(r"^[-*]\s+", lines[i]):
-                item_text = re.sub(r"^[-*]\s+", "", lines[i])
-                items.append(_make_list_item(item_text))
-                i += 1
-            doc["content"].append({"type": "bulletList", "content": items})
-            continue
-
-        # --- Ordered list ---
-        if re.match(r"^\d+\.\s+", line):
-            items_ol: list[dict[str, Any]] = []
-            while i < len(lines) and re.match(r"^\d+\.\s+", lines[i]):
-                item_text = re.sub(r"^\d+\.\s+", "", lines[i])
-                items_ol.append(_make_list_item(item_text))
-                i += 1
-            doc["content"].append({"type": "orderedList", "content": items_ol})
-            continue
-
-        # --- Table ---
-        if line.startswith("|") and "|" in line[1:]:
-            table_rows: list[str] = []
-            while i < len(lines) and lines[i].startswith("|"):
-                table_rows.append(lines[i])
-                i += 1
-
-            # Parse rows, skip separator (|---|---|)
-            data_rows: list[list[str]] = []
-            for row_line in table_rows:
-                cells = [c.strip() for c in row_line.strip("|").split("|")]
-                if all(re.match(r"^:?-+:?$", c) for c in cells if c):
-                    continue
-                data_rows.append(cells)
-
-            if data_rows:
-                adf_rows: list[dict[str, Any]] = []
-                for idx, cells in enumerate(data_rows):
-                    cell_type = "tableHeader" if idx == 0 else "tableCell"
-                    adf_cells = []
-                    for cell_text in cells:
-                        content = _parse_inline_formatting(cell_text)
-                        if not content:
-                            content = [{"type": "text", "text": ""}]
-                        adf_cells.append(
-                            {
-                                "type": cell_type,
-                                "content": [{"type": "paragraph", "content": content}],
-                            }
-                        )
-                    adf_rows.append({"type": "tableRow", "content": adf_cells})
-
-                doc["content"].append(
-                    {
-                        "type": "table",
-                        "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
-                        "content": adf_rows,
-                    }
-                )
-            continue
-
-        # --- Empty line (skip) ---
-        if not stripped:
-            i += 1
-            continue
-
-        # --- Paragraph (default) ---
-        doc["content"].append(_make_paragraph(line))
-        i += 1
-
-    # Ensure at least one content node
+    # ADF requires at least one content node.
     if not doc["content"]:
         doc["content"].append({"type": "paragraph", "content": []})
 
@@ -360,3 +417,10 @@ def adf_to_text(adf_content: dict | list | str | None) -> str | None:
         return None
 
     return None
+
+
+__all__ = [
+    "markdown_to_adf",
+    "adf_to_text",
+    "_parse_inline_formatting",
+]
