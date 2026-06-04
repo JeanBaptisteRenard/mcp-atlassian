@@ -107,6 +107,22 @@ class UsersMixin(JiraClient):
             error_msg = f"Unable to get current user account ID: {e}"
             raise Exception(error_msg) from e
 
+    # Jira Cloud account ID patterns:
+    # - Modern format: numeric prefix + ":" + UUID, e.g. "712020:09efad43-351a-45df-822a-0477dbeba4c3"
+    # - Legacy format: 24 lowercase hex chars, e.g. "5b109f2e9729b51b54dc274d"
+    _CLOUD_ACCOUNT_ID_RE = re.compile(
+        r"^\d+:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    )
+    _LEGACY_ACCOUNT_ID_RE = re.compile(r"^[0-9a-f]{24}$")
+
+    @classmethod
+    def _is_account_id(cls, value: str) -> bool:
+        """Return True if *value* already looks like a Jira Cloud account ID."""
+        return bool(
+            cls._CLOUD_ACCOUNT_ID_RE.match(value)
+            or cls._LEGACY_ACCOUNT_ID_RE.match(value)
+        )
+
     def _get_account_id(self, assignee: str) -> str:
         """
         Get the account ID for a username or account ID.
@@ -120,8 +136,11 @@ class UsersMixin(JiraClient):
         Raises:
             ValueError: If the account ID could not be found.
         """
-        # If it looks like an account ID already, return it
-        if assignee.startswith("5") and len(assignee) >= 10:
+        # If it already looks like an account ID, return it directly without
+        # performing any API lookup.  The old heuristic (startswith("5")) only
+        # covered the legacy 24-hex format and silently failed for the modern
+        # "712020:UUID" format used by Jira Cloud.
+        if self._is_account_id(assignee):
             return assignee
 
         account_id = self._lookup_user_directly(assignee)

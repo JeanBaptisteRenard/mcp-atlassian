@@ -82,7 +82,7 @@ class TestJiraUser:
         assert simplified["display_name"] == "Test User"
         assert simplified["email"] == "test@example.com"
         assert simplified["avatar_url"] == "https://example.com/avatar.png"
-        assert "account_id" not in simplified
+        assert simplified["account_id"] == "user123"
         assert "time_zone" not in simplified
 
     def test_from_api_response_server_dc_with_name_and_key(self):

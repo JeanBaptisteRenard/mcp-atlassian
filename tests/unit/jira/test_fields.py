@@ -768,7 +768,7 @@ class TestFormatFieldValueForWrite:
                 "accountId",
                 "user@ex.com",
                 "cloud-acc-id",
-                id="cloud",
+                id="cloud_email",
             ),
             pytest.param(
                 False,
@@ -798,17 +798,45 @@ class TestFormatFieldValueForWrite:
         )
         assert result == {user_field: resolved_id}
 
-    def test_custom_user_unresolvable(self, mixin):
-        """Unresolvable custom user field returns None instead of raising."""
+    def test_custom_user_account_id_passthrough(self, mixin):
+        """A raw Jira Cloud account ID string must be passed through without any API lookup.
+
+        Regression test for TAGPAY-37647: ``_get_account_id`` used
+        ``startswith('5')`` which missed the modern ``712020:UUID`` format,
+        causing _format_user to call the search API, fail silently, and drop
+        the field from the update payload.
+        """
+        modern_account_id = "712020:09efad43-351a-45df-822a-0477dbeba4c3"
+        mixin.config.is_cloud = True
+        # _get_account_id must return the value as-is — no lookup
+        mixin._get_account_id = MagicMock(return_value=modern_account_id)
+        field_def = {
+            "name": "Assigned To",
+            "schema": {"type": "user", "custom": "userpicker"},
+        }
+        result = mixin._format_field_value_for_write(
+            "customfield_10501", modern_account_id, field_def
+        )
+        assert result == {"accountId": modern_account_id}
+        mixin._get_account_id.assert_called_once_with(modern_account_id)
+
+    def test_custom_user_unresolvable_raises(self, mixin):
+        """Unresolvable user string must raise ValueError, not silently return None.
+
+        A tool that answers "Issue updated successfully" while dropping a field
+        undetected is the worst possible failure mode.  _format_user now
+        propagates the ValueError from _get_account_id so the caller can
+        surface a meaningful error.
+        """
         mixin._get_account_id = MagicMock(side_effect=ValueError("User not found"))
         field_def = {
             "name": "Reviewer",
             "schema": {"type": "user", "custom": "userpicker"},
         }
-        result = mixin._format_field_value_for_write(
-            "customfield_10022", "nobody@ex.com", field_def
-        )
-        assert result is None
+        with pytest.raises(ValueError, match="User not found"):
+            mixin._format_field_value_for_write(
+                "customfield_10022", "nobody@ex.com", field_def
+            )
 
     # -- Custom date field -----------------------------------------------
 

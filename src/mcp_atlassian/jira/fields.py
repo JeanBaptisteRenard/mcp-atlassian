@@ -714,18 +714,19 @@ class FieldsMixin(JiraClient, EpicOperationsProto, UsersOperationsProto):
             field_definition: Field definition dict, or None.
 
         Returns:
-            Dict with ``accountId`` (Cloud) or ``name`` (Server/DC),
-            or None on error.
+            Dict with ``accountId`` (Cloud) or ``name`` (Server/DC).
+
+        Raises:
+            ValueError: If *value* is a string that cannot be resolved to a
+                user identifier.  Raising (rather than silently returning
+                ``None``) prevents the field from being dropped without any
+                feedback, which would cause a silent no-op update.
         """
         if isinstance(value, str):
-            try:
-                identifier = self._get_account_id(value)
-                if self.config.is_cloud:
-                    return {"accountId": identifier}
-                return {"name": identifier}
-            except Exception as e:
-                logger.warning(f"Could not resolve user for field {field_id}: {e}")
-                return None
+            identifier = self._get_account_id(value)
+            if self.config.is_cloud:
+                return {"accountId": identifier}
+            return {"name": identifier}
         return value
 
     def _format_date(

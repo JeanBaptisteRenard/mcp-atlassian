@@ -146,14 +146,48 @@ class TestUsersMixin:
         # Verify self.jira.myself was called
         users_mixin.jira.myself.assert_called_once()
 
-    def test_get_account_id_already_account_id(self, users_mixin):
-        """Test that _get_account_id returns the input if it looks like an account ID."""
-        # Call the method with a string that looks like an account ID
-        account_id = users_mixin._get_account_id("5abcdef1234567890")
+    @pytest.mark.parametrize(
+        "value, expected",
+        [
+            # Modern Jira Cloud: numeric prefix + ":" + UUID
+            ("712020:09efad43-351a-45df-822a-0477dbeba4c3", True),
+            ("1234:abcdef12-abcd-abcd-abcd-abcdef123456", True),
+            # Legacy 24-char lowercase hex
+            ("5b109f2e9729b51b54dc274d", True),
+            ("abcdef1234567890abcdef12", True),
+            # Not account IDs
+            ("user@example.com", False),
+            ("johndoe", False),
+            # Old heuristic: "5abcdef1234567890" — not 24 hex, not UUID format
+            ("5abcdef1234567890", False),
+            # UUID only (no numeric prefix) — not a Jira accountId
+            ("09efad43-351a-45df-822a-0477dbeba4c3", False),
+        ],
+    )
+    def test_is_account_id(self, users_mixin, value: str, expected: bool):
+        """_is_account_id correctly identifies Jira Cloud account ID formats."""
+        from mcp_atlassian.jira.users import UsersMixin
 
-        # Verify result
-        assert account_id == "5abcdef1234567890"
-        # Verify no lookups were performed
+        assert UsersMixin._is_account_id(value) is expected
+
+    def test_get_account_id_already_account_id_legacy(self, users_mixin):
+        """Test that _get_account_id returns a legacy 24-hex account ID directly."""
+        legacy_id = "5b109f2e9729b51b54dc274d"
+        account_id = users_mixin._get_account_id(legacy_id)
+        assert account_id == legacy_id
+        users_mixin.jira.user_find_by_user_string.assert_not_called()
+
+    def test_get_account_id_already_account_id_modern_cloud(self, users_mixin):
+        """Test that _get_account_id returns a modern Jira Cloud account ID directly.
+
+        Modern Jira Cloud uses a ``<numeric>:<UUID>`` format such as
+        ``712020:09efad43-351a-45df-822a-0477dbeba4c3``.  The old heuristic
+        (``startswith('5')``) failed to recognise this pattern, causing a silent
+        field drop (TAGPAY-37647 / customfield_10501 regression).
+        """
+        modern_id = "712020:09efad43-351a-45df-822a-0477dbeba4c3"
+        account_id = users_mixin._get_account_id(modern_id)
+        assert account_id == modern_id
         users_mixin.jira.user_find_by_user_string.assert_not_called()
 
     def test_get_account_id_direct_lookup(self, users_mixin):
