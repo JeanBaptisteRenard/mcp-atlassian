@@ -571,6 +571,13 @@ async def create_page(
             default=None,
         ),
     ] = None,
+    page_width: Annotated[
+        str,
+        Field(
+            description="(Optional) Page layout width. Defaults to 'full-width' (wide, recommended) because Confluence's own 'default' fixed width is cramped for technical docs. Values: 'full-width', 'max' (extra-wide), or 'default' (Confluence narrow fixed width).",
+            default="full-width",
+        ),
+    ] = "full-width",
 ) -> str:
     """Create a new Confluence page.
 
@@ -584,6 +591,7 @@ async def create_page(
         enable_heading_anchors: Whether to enable heading anchors (markdown only).
         include_content: Whether to include page content in the response.
         emoji: Optional page title emoji (icon shown in navigation).
+        page_width: Page layout width ('full-width' default, 'max', or 'default').
 
     Returns:
         JSON string representing the created page object.
@@ -618,6 +626,7 @@ async def create_page(
         else False,
         content_representation=content_representation,
         emoji=emoji,
+        page_width=page_width,
     )
     result = page.to_simplified_dict()
     if not include_content:
@@ -683,6 +692,13 @@ async def update_page(
             default=None,
         ),
     ] = None,
+    page_width: Annotated[
+        str | None,
+        Field(
+            description="(Optional) Page layout width: 'full-width' (wide), 'max' (extra-wide), or 'default' (Confluence narrow). Omit/None to keep the page's current width; pass an empty string to reset to Confluence default.",
+            default=None,
+        ),
+    ] = None,
 ) -> str:
     """Update an existing Confluence page.
 
@@ -698,6 +714,7 @@ async def update_page(
         enable_heading_anchors: Whether to enable heading anchors (markdown only).
         include_content: Whether to include page content in the response.
         emoji: Optional page title emoji (icon shown in navigation).
+        page_width: Optional page layout width; None keeps current width.
 
     Returns:
         JSON string representing the updated page object.
@@ -734,6 +751,7 @@ async def update_page(
         else False,
         content_representation=content_representation,
         emoji=emoji,
+        page_width=page_width,
     )
     page_data = updated_page.to_simplified_dict()
     if not include_content:

@@ -641,6 +641,37 @@ async def test_create_page_with_string_parent_id(client, mock_confluence_fetcher
 
 
 @pytest.mark.anyio
+async def test_create_page_defaults_to_full_width(client, mock_confluence_fetcher):
+    """create_page defaults page_width to 'full-width' (Confluence's own default is cramped)."""
+    await client.call_tool(
+        "confluence_create_page",
+        {"space_key": "TEST", "title": "Test Page", "content": "Test content"},
+    )
+    call_kwargs = mock_confluence_fetcher.create_page.call_args.kwargs
+    assert call_kwargs["page_width"] == "full-width"
+
+
+@pytest.mark.anyio
+async def test_create_page_respects_explicit_page_width(client, mock_confluence_fetcher):
+    """An explicit page_width is forwarded unchanged."""
+    await client.call_tool(
+        "confluence_create_page",
+        {"space_key": "TEST", "title": "T", "content": "c", "page_width": "max"},
+    )
+    assert mock_confluence_fetcher.create_page.call_args.kwargs["page_width"] == "max"
+
+
+@pytest.mark.anyio
+async def test_update_page_defaults_page_width_to_none(client, mock_confluence_fetcher):
+    """update_page leaves width unchanged by default (page_width=None)."""
+    await client.call_tool(
+        "confluence_update_page",
+        {"page_id": "123", "title": "T", "content": "c"},
+    )
+    assert mock_confluence_fetcher.update_page.call_args.kwargs["page_width"] is None
+
+
+@pytest.mark.anyio
 async def test_create_page_include_content(client, mock_confluence_fetcher):
     """Test create_page can include content when requested."""
     response = await client.call_tool(
