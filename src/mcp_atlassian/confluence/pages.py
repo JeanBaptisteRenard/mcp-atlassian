@@ -667,6 +667,21 @@ class PagesMixin(ConfluenceClient):
 
             logger.debug(f"Updating page {page_id} with title '{title}'")
 
+            # If page_width is omitted, capture the page's current width so it
+            # can be re-applied after the update. Confluence does not carry
+            # the appearance setting forward to the new version on its own,
+            # so leaving this out would silently reset a full-width page to
+            # the default layout.
+            existing_page_width: str | None = None
+            if page_width is None:
+                try:
+                    existing_page_width = self._get_page_width(page_id)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to read existing page width for page {page_id}, "
+                        f"appearance may reset to default: {str(e)}"
+                    )
+
             # Use v2 API for OAuth authentication, v1 API for token/basic auth
             v2_adapter = self._v2_adapter
             if v2_adapter:
@@ -710,6 +725,10 @@ class PagesMixin(ConfluenceClient):
                 # Empty string means reset to default, otherwise set it
                 width_to_set = page_width if page_width else None
                 self._set_page_width(page_id, width_to_set)
+            elif existing_page_width:
+                # Re-apply the previously set width so it survives the new
+                # version created by this update.
+                self._set_page_width(page_id, existing_page_width)
 
             # After update, refresh the page data
             return self.get_page_content(page_id)

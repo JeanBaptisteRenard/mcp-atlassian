@@ -450,6 +450,130 @@ class TestPagesMixin:
             assert isinstance(result, ConfluencePage)
             assert result.id == page_id
 
+    def test_update_page_preserves_existing_width_when_omitted(self, pages_mixin):
+        """Omitting page_width must re-post the page's current width.
+
+        Regression test: Confluence resets a full-width page to the default
+        layout on update unless the content-appearance properties are
+        re-applied for the new version, even when the caller didn't intend
+        to change the width at all.
+        """
+        # Arrange
+        page_id = "987654321"
+        title = "Updated Page"
+        body = "<p>Updated content</p>"
+
+        mock_document = ConfluencePage(
+            id=page_id,
+            title=title,
+            content="Updated content",
+            space={"key": "PROJ", "name": "Project"},
+            version={"number": 2},
+        )
+        with (
+            patch.object(pages_mixin, "get_page_content", return_value=mock_document),
+            patch.object(
+                pages_mixin, "_get_page_width", return_value="full-width"
+            ) as mock_get_width,
+            patch.object(pages_mixin, "_set_page_width") as mock_set_width,
+        ):
+            # Act - page_width intentionally omitted
+            pages_mixin.update_page(page_id, title, body, is_markdown=False)
+
+            # Assert - existing width was read and re-applied
+            mock_get_width.assert_called_once_with(page_id)
+            mock_set_width.assert_called_once_with(page_id, "full-width")
+
+    def test_update_page_no_existing_width_does_nothing(self, pages_mixin):
+        """If the page has no width property, omitting page_width is a no-op."""
+        # Arrange
+        page_id = "987654321"
+        title = "Updated Page"
+        body = "<p>Updated content</p>"
+
+        mock_document = ConfluencePage(
+            id=page_id,
+            title=title,
+            content="Updated content",
+            space={"key": "PROJ", "name": "Project"},
+            version={"number": 2},
+        )
+        with (
+            patch.object(pages_mixin, "get_page_content", return_value=mock_document),
+            patch.object(
+                pages_mixin, "_get_page_width", return_value=None
+            ) as mock_get_width,
+            patch.object(pages_mixin, "_set_page_width") as mock_set_width,
+        ):
+            # Act - page_width intentionally omitted
+            pages_mixin.update_page(page_id, title, body, is_markdown=False)
+
+            # Assert - nothing to preserve, so nothing is set
+            mock_get_width.assert_called_once_with(page_id)
+            mock_set_width.assert_not_called()
+
+    def test_update_page_with_explicit_page_width_still_sets_it(self, pages_mixin):
+        """Explicitly passing page_width keeps setting it directly (no regression).
+
+        The preservation logic only kicks in when page_width is omitted; an
+        explicit value must not trigger a read of the existing width.
+        """
+        # Arrange
+        page_id = "987654321"
+        title = "Updated Page"
+        body = "<p>Updated content</p>"
+
+        mock_document = ConfluencePage(
+            id=page_id,
+            title=title,
+            content="Updated content",
+            space={"key": "PROJ", "name": "Project"},
+            version={"number": 2},
+        )
+        with (
+            patch.object(pages_mixin, "get_page_content", return_value=mock_document),
+            patch.object(pages_mixin, "_get_page_width") as mock_get_width,
+            patch.object(pages_mixin, "_set_page_width") as mock_set_width,
+        ):
+            # Act
+            pages_mixin.update_page(
+                page_id, title, body, is_markdown=False, page_width="max"
+            )
+
+            # Assert - set directly, no need to read the existing value first
+            mock_get_width.assert_not_called()
+            mock_set_width.assert_called_once_with(page_id, "max")
+
+    def test_update_page_with_empty_string_page_width_resets_to_default(
+        self, pages_mixin
+    ):
+        """Explicit empty-string page_width still means reset-to-default (no regression)."""
+        # Arrange
+        page_id = "987654321"
+        title = "Updated Page"
+        body = "<p>Updated content</p>"
+
+        mock_document = ConfluencePage(
+            id=page_id,
+            title=title,
+            content="Updated content",
+            space={"key": "PROJ", "name": "Project"},
+            version={"number": 2},
+        )
+        with (
+            patch.object(pages_mixin, "get_page_content", return_value=mock_document),
+            patch.object(pages_mixin, "_get_page_width") as mock_get_width,
+            patch.object(pages_mixin, "_set_page_width") as mock_set_width,
+        ):
+            # Act
+            pages_mixin.update_page(
+                page_id, title, body, is_markdown=False, page_width=""
+            )
+
+            # Assert - reset to default, no read of the existing value
+            mock_get_width.assert_not_called()
+            mock_set_width.assert_called_once_with(page_id, None)
+
     def test_delete_page_success(self, pages_mixin):
         """Test successfully deleting a page."""
         # Arrange
